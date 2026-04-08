@@ -4,6 +4,7 @@ import csv
 import io
 import math
 import statistics
+import tempfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ PREVIEW_ROW_COUNT = 8
 TOP_CATEGORY_COUNT = 6
 DEFAULT_RELATIVE_MDE = 0.1
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+LARGE_UPLOAD_BYTES = 12 * 1024 * 1024
+LARGE_UPLOAD_ROW_THRESHOLD = 400_000
 
 
 def list_sample_datasets(artifact_dir: Path) -> list[dict[str, str]]:
@@ -32,29 +35,47 @@ def list_sample_datasets(artifact_dir: Path) -> list[dict[str, str]]:
 
 
 def profile_csv_file(csv_path: Path, source_type: str, source_label: str) -> dict[str, Any]:
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
-        return profile_csv_text(file_obj.read(), source_type=source_type, source_label=source_label)
-
-
-def profile_csv_text(csv_text: str, source_type: str, source_label: str) -> dict[str, Any]:
-    reader = csv.DictReader(io.StringIO(csv_text))
-    fieldnames = reader.fieldnames or []
-    rows = [normalize_row(row, fieldnames) for row in reader]
-
+    fieldnames, preview_rows, column_meta = inspect_csv_file(csv_path)
     if not fieldnames:
         raise ValueError("CSV must include a header row.")
 
-    columns = [summarize_column(fieldname, rows) for fieldname in fieldnames]
+    file_size = csv_path.stat().st_size
+    compact_overview = source_type == "upload" and (
+        file_size >= LARGE_UPLOAD_BYTES or column_meta["rowCount"] >= LARGE_UPLOAD_ROW_THRESHOLD
+    )
+    columns = summarize_csv_columns(
+        csv_path,
+        fieldnames,
+        column_meta,
+        compact_overview=compact_overview,
+    )
+    profile_notice = None
+    if compact_overview:
+        profile_notice = (
+            "Large upload mode is active. To keep analysis responsive, the overview omits some expensive "
+            "column details such as full medians and histograms."
+        )
 
     return {
         "sourceType": source_type,
         "sourceLabel": source_label,
-        "rowCount": len(rows),
+        "rowCount": column_meta["rowCount"],
         "columnCount": len(fieldnames),
         "columns": columns,
-        "abAnalysis": infer_ab_analysis(rows, columns),
-        "previewRows": rows[:PREVIEW_ROW_COUNT],
+        "abAnalysis": infer_ab_analysis_from_file(csv_path, columns, column_meta["rowCount"]),
+        "previewRows": preview_rows,
+        "profileNotice": profile_notice,
     }
+
+
+def profile_csv_text(csv_text: str, source_type: str, source_label: str) -> dict[str, Any]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8-sig") as temp_file:
+        temp_file.write(csv_text)
+        temp_path = Path(temp_file.name)
+    try:
+        return profile_csv_file(temp_path, source_type=source_type, source_label=source_label)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def normalize_row(row: dict[str, Any], fieldnames: list[str]) -> dict[str, str]:
@@ -96,6 +117,142 @@ def summarize_column(column_name: str, rows: list[dict[str, str]]) -> dict[str, 
             for value, count in category_counter.most_common(TOP_CATEGORY_COUNT)
         ],
     }
+
+
+def inspect_csv_file(csv_path: Path) -> tuple[list[str], list[dict[str, str]], dict[str, Any]]:
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fieldnames = reader.fieldnames or []
+        if not fieldnames:
+            return [], [], {"rowCount": 0, "columns": {}}
+
+        preview_rows: list[dict[str, str]] = []
+        column_meta = {
+            fieldname: {"count": 0, "missingCount": 0, "numericPossible": True}
+            for fieldname in fieldnames
+        }
+        row_count = 0
+
+        for raw_row in reader:
+            row = normalize_row(raw_row, fieldnames)
+            row_count += 1
+            if len(preview_rows) < PREVIEW_ROW_COUNT:
+                preview_rows.append(row)
+
+            for fieldname in fieldnames:
+                value = row[fieldname]
+                meta = column_meta[fieldname]
+                if is_missing(value):
+                    meta["missingCount"] += 1
+                    continue
+                meta["count"] += 1
+                if meta["numericPossible"]:
+                    lowered = value.lower()
+                    if lowered in {"true", "false"}:
+                        meta["numericPossible"] = False
+                    else:
+                        try:
+                            float(value)
+                        except ValueError:
+                            meta["numericPossible"] = False
+
+        return fieldnames, preview_rows, {"rowCount": row_count, "columns": column_meta}
+
+
+def summarize_csv_columns(
+    csv_path: Path,
+    fieldnames: list[str],
+    column_meta_container: dict[str, Any],
+    compact_overview: bool = False,
+) -> list[dict[str, Any]]:
+    column_meta = column_meta_container["columns"]
+    numeric_columns = [name for name in fieldnames if column_meta[name]["numericPossible"] and column_meta[name]["count"] > 0]
+    categorical_columns = [name for name in fieldnames if name not in numeric_columns]
+
+    numeric_values: dict[str, list[float]] = {name: [] for name in numeric_columns} if not compact_overview else {}
+    numeric_stats: dict[str, dict[str, float | None]] = (
+        {
+            name: {
+                "sum": 0.0,
+                "min": None,
+                "max": None,
+            }
+            for name in numeric_columns
+        }
+        if compact_overview
+        else {}
+    )
+    categorical_counters: dict[str, Counter[str]] = {name: Counter() for name in categorical_columns}
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        for raw_row in reader:
+            row = normalize_row(raw_row, fieldnames)
+            for fieldname in numeric_columns:
+                value = row[fieldname]
+                if is_missing(value):
+                    continue
+                numeric_value = float(value)
+                if compact_overview:
+                    stats = numeric_stats[fieldname]
+                    stats["sum"] += numeric_value
+                    stats["min"] = numeric_value if stats["min"] is None else min(stats["min"], numeric_value)
+                    stats["max"] = numeric_value if stats["max"] is None else max(stats["max"], numeric_value)
+                else:
+                    numeric_values[fieldname].append(numeric_value)
+            for fieldname in categorical_columns:
+                value = row[fieldname]
+                if is_missing(value):
+                    continue
+                categorical_counters[fieldname][value] += 1
+
+    columns: list[dict[str, Any]] = []
+    for fieldname in fieldnames:
+        meta = column_meta[fieldname]
+        if fieldname in numeric_columns:
+            if compact_overview:
+                stats = numeric_stats[fieldname]
+                mean = round(stats["sum"] / meta["count"], 4) if meta["count"] else None
+                min_value = round(stats["min"], 4) if stats["min"] is not None else None
+                max_value = round(stats["max"], 4) if stats["max"] is not None else None
+                median = None
+                histogram: list[dict[str, Any]] = []
+            else:
+                values = numeric_values[fieldname]
+                mean = round(statistics.fmean(values), 4) if values else None
+                median = round(statistics.median(values), 4) if values else None
+                min_value = round(min(values), 4) if values else None
+                max_value = round(max(values), 4) if values else None
+                histogram = build_histogram(values)
+            columns.append(
+                {
+                    "name": fieldname,
+                    "type": "numeric",
+                    "count": meta["count"],
+                    "missingCount": meta["missingCount"],
+                    "mean": mean,
+                    "median": median,
+                    "min": min_value,
+                    "max": max_value,
+                    "histogram": histogram,
+                }
+            )
+        else:
+            counter = categorical_counters[fieldname]
+            columns.append(
+                {
+                    "name": fieldname,
+                    "type": "categorical",
+                    "count": meta["count"],
+                    "missingCount": meta["missingCount"],
+                    "uniqueValues": len(counter),
+                    "topValues": [
+                        {"value": value, "count": count}
+                        for value, count in counter.most_common(TOP_CATEGORY_COUNT)
+                    ],
+                }
+            )
+    return columns
 
 
 def is_missing(value: str) -> bool:
@@ -164,6 +321,278 @@ def format_number(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def infer_ab_analysis_from_file(csv_path: Path, columns: list[dict[str, Any]], row_count: int) -> dict[str, Any]:
+    if row_count == 0:
+        return {
+            "status": "not_ready",
+            "summary": "No data rows are available yet.",
+            "recommendations": [
+                "Upload or select a dataset with experiment rows before running A/B analysis.",
+            ],
+        }
+
+    group_column = detect_group_column_from_summaries(columns)
+    conversion_column = detect_conversion_column_from_summaries(columns)
+
+    if group_column is None or conversion_column is None:
+        recommendations = []
+        if group_column is None:
+            recommendations.append("Add or map a cohort column with two variants, such as control and treatment.")
+        if conversion_column is None:
+            recommendations.append("Add or map a binary outcome column with values like 0/1 or true/false.")
+        recommendations.append("Once both columns are present, compute conversion rates, p-value, confidence, and sample-size sufficiency.")
+        return {
+            "status": "not_ready",
+            "summary": "This dataset is not yet structured like a two-cohort A/B test table.",
+            "recommendations": recommendations,
+        }
+
+    user_id_column = detect_user_id_column(columns)
+    compatibility_column = detect_compatibility_column(columns, group_column)
+    timestamp_column = detect_timestamp_column(columns)
+    day_column = next((column["name"] for column in columns if column["name"].lower() == "most ads day"), None)
+    hour_column = next((column["name"] for column in columns if "hour" in column["name"].lower()), None)
+    compatibility_map = infer_group_compatibility_map_from_columns(columns, group_column, compatibility_column)
+
+    selected_fields = {
+        field
+        for field in [group_column, conversion_column, user_id_column, compatibility_column, timestamp_column, day_column, hour_column]
+        if field is not None
+    }
+
+    quality = {
+        "rawRows": row_count,
+        "analyzedRows": 0,
+        "removedRows": 0,
+        "duplicateUsersRemoved": 0,
+        "incompatibleRowsRemoved": 0,
+    }
+
+    seen_users: set[str] = set()
+    group_counts: Counter[str] = Counter()
+    conversions_by_group: Counter[str] = Counter()
+    trend_totals: dict[str, Counter[str]] = {}
+    trend_conversions: dict[str, Counter[str]] = {}
+    segment_totals: dict[str, Counter[str]] = {}
+    segment_conversions: dict[str, Counter[str]] = {}
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fieldnames = reader.fieldnames or []
+        for raw_row in reader:
+            normalized = normalize_row(raw_row, fieldnames)
+            row = {field: normalized.get(field, "") for field in selected_fields}
+
+            if compatibility_column is not None and compatibility_map:
+                group_value = row.get(group_column, "")
+                compatibility_value = row.get(compatibility_column, "")
+                if (
+                    not is_missing(group_value)
+                    and not is_missing(compatibility_value)
+                    and compatibility_map.get(group_value) != compatibility_value
+                ):
+                    quality["incompatibleRowsRemoved"] += 1
+                    continue
+
+            if user_id_column is not None:
+                user_id = row.get(user_id_column, "")
+                if not is_missing(user_id):
+                    if user_id in seen_users:
+                        quality["duplicateUsersRemoved"] += 1
+                        continue
+                    seen_users.add(user_id)
+
+            group_value = row.get(group_column, "")
+            metric_value = row.get(conversion_column, "")
+            if is_missing(group_value) or is_missing(metric_value):
+                continue
+
+            outcome = parse_binary_value(metric_value)
+            group_counts[group_value] += 1
+            conversions_by_group[group_value] += outcome
+            quality["analyzedRows"] += 1
+
+            trend_bucket = get_trend_bucket(row, timestamp_column, day_column)
+            if trend_bucket is not None:
+                trend_totals.setdefault(trend_bucket, Counter())[group_value] += 1
+                trend_conversions.setdefault(trend_bucket, Counter())[group_value] += outcome
+
+            segment_bucket = get_segment_bucket(row, hour_column)
+            if segment_bucket is not None:
+                segment_totals.setdefault(segment_bucket, Counter())[group_value] += 1
+                segment_conversions.setdefault(segment_bucket, Counter())[group_value] += outcome
+
+    quality["removedRows"] = quality["rawRows"] - quality["analyzedRows"]
+
+    if len(group_counts) != 2:
+        return {
+            "status": "not_ready",
+            "summary": "A/B analysis currently expects exactly two populated cohorts.",
+            "recommendations": [
+                f"Column '{group_column}' currently has {len(group_counts)} populated cohorts.",
+                "Filter or remap the data so only control and one variant remain before significance testing.",
+            ],
+        }
+
+    ordered_groups = choose_group_order(group_counts)
+    group_metrics: list[dict[str, Any]] = []
+    for group_name in ordered_groups:
+        total = group_counts[group_name]
+        successes = conversions_by_group[group_name]
+        rate = successes / total if total else 0.0
+        group_metrics.append(
+            {
+                "name": group_name,
+                "size": total,
+                "conversions": successes,
+                "conversionRate": round(rate * 100, 4),
+            }
+        )
+
+    control = group_metrics[0]
+    variant = group_metrics[1]
+    significance = calculate_significance(
+        control["conversions"],
+        control["size"],
+        variant["conversions"],
+        variant["size"],
+    )
+    confidence_interval = calculate_difference_confidence_interval(
+        control["conversions"],
+        control["size"],
+        variant["conversions"],
+        variant["size"],
+    )
+    sample_size = estimate_required_sample_size(
+        baseline_rate=control["conversionRate"] / 100,
+        relative_mde=DEFAULT_RELATIVE_MDE,
+    )
+    is_sample_size_enough = control["size"] >= sample_size and variant["size"] >= sample_size
+    cohort_size_progress = build_cohort_size_progress(group_metrics, sample_size)
+    uplift = calculate_uplift(control["conversionRate"], variant["conversionRate"])
+    absolute_lift = variant["conversionRate"] - control["conversionRate"]
+    sample_ratio_mismatch = calculate_sample_ratio_mismatch([control["size"], variant["size"]])
+
+    charts: dict[str, Any] = {
+        "cohortSizes": [{"name": cohort["name"], "value": cohort["size"]} for cohort in group_metrics],
+        "conversionRates": [{"name": cohort["name"], "value": cohort["conversionRate"]} for cohort in group_metrics],
+    }
+    trend_chart = build_series_chart_from_aggregates(
+        title="Conversion Rate Over Time" if timestamp_column is not None else "Conversion Rate By Day",
+        totals=trend_totals,
+        conversions=trend_conversions,
+        order=None if timestamp_column is not None else DAY_ORDER,
+    )
+    if trend_chart is not None:
+        charts["trendChart"] = trend_chart
+    segment_chart = build_series_chart_from_aggregates(
+        title="Conversion Rate By Hour",
+        totals=segment_totals,
+        conversions=segment_conversions,
+        order=[str(hour) for hour in range(24)] if hour_column is not None else None,
+    )
+    if segment_chart is not None:
+        charts["segmentChart"] = segment_chart
+
+    interpretation = build_interpretation(
+        control_name=control["name"],
+        variant_name=variant["name"],
+        is_significant=significance["isSignificant"],
+        relative_lift=uplift,
+        p_value=significance["pValue"],
+        is_sample_size_enough=is_sample_size_enough,
+        has_srm=sample_ratio_mismatch["isMismatch"],
+    )
+
+    recommendations = [
+        f"Use '{group_column}' as the cohort column and '{conversion_column}' as the binary outcome.",
+        "Show conversion-rate lift, p-value, confidence interval, and sample ratio checks together in the results header.",
+        "Use the trend and segment charts to see whether the result is stable over time or concentrated in one slice.",
+    ]
+    if quality["incompatibleRowsRemoved"] > 0:
+        recommendations.append(
+            f"Excluded {quality['incompatibleRowsRemoved']:,} rows where cohort and experience assignment conflicted."
+        )
+    if quality["duplicateUsersRemoved"] > 0:
+        recommendations.append(
+            f"Deduplicated {quality['duplicateUsersRemoved']:,} repeated user records before testing."
+        )
+    if not is_sample_size_enough:
+        recommendations.append(
+            f"Keep collecting data until each cohort reaches about {sample_size:,} observations for a 10% relative MDE check."
+        )
+    if sample_ratio_mismatch["isMismatch"]:
+        recommendations.append("Investigate sample ratio mismatch before trusting the treatment effect at face value.")
+    if significance["isSignificant"]:
+        recommendations.append("This result is statistically significant at the 95% level, so the variant is ready for decisioning.")
+    else:
+        recommendations.append("The current p-value is above 0.05, so treat the result as inconclusive for now.")
+
+    return {
+        "status": "ready",
+        "summary": "This dataset is ready for a basic binary-outcome A/B test analysis.",
+        "groupColumn": group_column,
+        "metricColumn": conversion_column,
+        "quality": quality,
+        "cohorts": group_metrics,
+        "absoluteLiftPctPoints": round(absolute_lift, 4),
+        "upliftPercent": round(uplift, 4),
+        "pValue": significance["pValue"],
+        "confidence": significance["confidence"],
+        "isSignificant": significance["isSignificant"],
+        "confidenceIntervalPctPoints": confidence_interval,
+        "requiredSampleSizePerCohort": sample_size,
+        "isSampleSizeEnough": is_sample_size_enough,
+        "cohortSizeProgress": cohort_size_progress,
+        "sampleRatioMismatch": sample_ratio_mismatch,
+        "interpretation": interpretation,
+        "charts": charts,
+        "recommendations": recommendations,
+    }
+
+
+def detect_group_column_from_summaries(columns: list[dict[str, Any]]) -> str | None:
+    categorical_candidates = [column for column in columns if column["type"] == "categorical"]
+    group_column = next(
+        (
+            column["name"]
+            for column in categorical_candidates
+            if 2 <= column.get("uniqueValues", 0) <= 4 and "group" in column["name"].lower()
+        ),
+        None,
+    )
+    if group_column is not None:
+        return group_column
+    return next(
+        (column["name"] for column in categorical_candidates if 2 <= column.get("uniqueValues", 0) <= 4),
+        None,
+    )
+
+
+def detect_conversion_column_from_summaries(columns: list[dict[str, Any]]) -> str | None:
+    binary_candidates = [column for column in columns if is_binary_summary_column(column)]
+    conversion_column = next(
+        (
+            column["name"]
+            for column in binary_candidates
+            if any(token in column["name"].lower() for token in ("convert", "conversion", "clicked", "purchase", "signup"))
+        ),
+        None,
+    )
+    if conversion_column is not None:
+        return conversion_column
+    return next((column["name"] for column in binary_candidates), None)
+
+
+def is_binary_summary_column(column: dict[str, Any]) -> bool:
+    if column["type"] == "numeric":
+        return column.get("min") in {0, 0.0} and column.get("max") in {1, 1.0}
+    if column["type"] == "categorical" and column.get("uniqueValues") == 2:
+        values = {item["value"].strip().lower() for item in column.get("topValues", [])}
+        return values.issubset({"0", "1", "true", "false"}) and bool(values)
+    return False
 
 
 def infer_ab_analysis(rows: list[dict[str, str]], columns: list[dict[str, Any]]) -> dict[str, Any]:
@@ -362,6 +791,82 @@ def infer_ab_analysis(rows: list[dict[str, str]], columns: list[dict[str, Any]])
         "charts": charts,
         "recommendations": recommendations,
     }
+
+
+def infer_group_compatibility_map_from_columns(
+    columns: list[dict[str, Any]],
+    group_column: str,
+    compatibility_column: str | None,
+) -> dict[str, str]:
+    if compatibility_column is None:
+        return {}
+
+    group_summary = next((column for column in columns if column["name"] == group_column), None)
+    compatibility_summary = next((column for column in columns if column["name"] == compatibility_column), None)
+    if group_summary is None or compatibility_summary is None:
+        return {}
+    if group_summary["type"] != "categorical" or compatibility_summary["type"] != "categorical":
+        return {}
+
+    group_values = [item["value"] for item in group_summary.get("topValues", [])]
+    compatibility_values = [item["value"] for item in compatibility_summary.get("topValues", [])]
+    if len(group_values) < 2 or len(compatibility_values) < 2:
+        return {}
+
+    lower_group_values = {value.lower(): value for value in group_values}
+    lower_compatibility_values = {value.lower(): value for value in compatibility_values}
+    if {"control", "treatment"}.issubset(lower_group_values.keys()) and {"old_page", "new_page"}.issubset(lower_compatibility_values.keys()):
+        return {
+            lower_group_values["control"]: lower_compatibility_values["old_page"],
+            lower_group_values["treatment"]: lower_compatibility_values["new_page"],
+        }
+    return {}
+
+
+def get_trend_bucket(row: dict[str, str], timestamp_column: str | None, day_column: str | None) -> str | None:
+    if timestamp_column is not None:
+        timestamp_value = row.get(timestamp_column, "")
+        if not is_missing(timestamp_value):
+            return parse_date_bucket(timestamp_value)
+    if day_column is not None:
+        day_value = row.get(day_column, "")
+        if not is_missing(day_value):
+            return day_value
+    return None
+
+
+def get_segment_bucket(row: dict[str, str], hour_column: str | None) -> str | None:
+    if hour_column is None:
+        return None
+    hour_value = row.get(hour_column, "")
+    if is_missing(hour_value):
+        return None
+    return hour_value
+
+
+def build_series_chart_from_aggregates(
+    title: str,
+    totals: dict[str, Counter[str]],
+    conversions: dict[str, Counter[str]],
+    order: list[str] | None,
+) -> dict[str, Any] | None:
+    if not totals:
+        return None
+
+    labels = order if order is not None else sorted(totals.keys())
+    data: list[dict[str, Any]] = []
+    for label in labels:
+        if label not in totals:
+            continue
+        row: dict[str, Any] = {"label": label}
+        for group_name, total in totals[label].items():
+            converted = conversions.get(label, Counter()).get(group_name, 0)
+            row[group_name] = round((converted / total) * 100, 4) if total else 0.0
+        data.append(row)
+
+    if not data:
+        return None
+    return {"title": title, "xKey": "label", "data": data}
 
 
 def is_binary_metric_column(rows: list[dict[str, str]], column_name: str) -> bool:

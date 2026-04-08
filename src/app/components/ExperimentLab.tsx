@@ -60,6 +60,7 @@ type DatasetProfile = {
   columns: ColumnSummary[];
   abAnalysis?: ABAnalysis;
   previewRows: Array<Record<string, string>>;
+  profileNotice?: string | null;
 };
 
 type ChartDatum = {
@@ -329,6 +330,20 @@ export function ExperimentLab() {
           <div className="space-y-6">
             <SourceSummary dataset={dataset} numericColumns={numericColumns.length} categoricalColumns={categoricalColumns.length} />
 
+            {dataset.profileNotice ? (
+              <Card className="border-amber-200 bg-amber-50">
+                <CardContent className="pt-6">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="mt-0.5 size-5 text-amber-700" />
+                    <div>
+                      <div className="font-medium text-amber-950">Large upload optimization</div>
+                      <div className="mt-1 text-sm text-amber-800">{dataset.profileNotice}</div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
+
             <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-4">
               <OverviewStat
                 icon={<FileSpreadsheet className="size-5 text-cyan-700" />}
@@ -484,6 +499,11 @@ function OverviewStat({ icon, label, value }: { icon: ReactNode; label: string; 
 }
 
 function NumericColumnCard({ column }: { column: NumericColumnSummary }) {
+  const histogramNotice =
+    column.count > 0 && column.histogram.length === 0
+      ? "Detailed distribution is skipped for this large upload."
+      : undefined;
+
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4">
       <div className="flex items-start justify-between gap-4">
@@ -505,7 +525,7 @@ function NumericColumnCard({ column }: { column: NumericColumnSummary }) {
 
       <div className="mt-5">
         <div className="mb-2 text-sm font-medium text-slate-700">Distribution</div>
-        <MiniHistogram bins={column.histogram} />
+        <MiniHistogram bins={column.histogram} emptyMessage={histogramNotice} />
       </div>
     </div>
   );
@@ -566,11 +586,15 @@ function StatChip({ label, value }: { label: string; value: string }) {
   );
 }
 
-function MiniHistogram({ bins }: { bins: HistogramBin[] }) {
+function MiniHistogram({ bins, emptyMessage }: { bins: HistogramBin[]; emptyMessage?: string }) {
   const maxCount = Math.max(...bins.map((bin) => bin.count), 1);
 
   if (bins.length === 0) {
-    return <div className="rounded-xl bg-slate-50 px-3 py-4 text-sm text-slate-500">No numeric values to chart.</div>;
+    return (
+      <div className="rounded-xl bg-slate-50 px-3 py-4 text-sm text-slate-500">
+        {emptyMessage ?? "No numeric values to chart."}
+      </div>
+    );
   }
 
   return (
