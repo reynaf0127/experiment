@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -57,13 +59,18 @@ async def upload_csv(file: UploadFile = File(...)) -> dict[str, object]:
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a CSV file.")
 
+    temp_path: Path | None = None
     try:
-        csv_text = (await file.read()).decode("utf-8-sig")
-        return profile_csv_text(csv_text, source_type="upload", source_label=file.filename)
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=400, detail="CSV file must be UTF-8 encoded.") from exc
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
+            shutil.copyfileobj(file.file, temp_file)
+            temp_path = Path(temp_file.name)
+        return profile_csv_file(temp_path, source_type="upload", source_label=file.filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await file.close()
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 if DIST_DIR.exists():
