@@ -4,13 +4,16 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .data_profile import list_sample_datasets, profile_csv_file, profile_csv_text
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR = BASE_DIR / "artifect"
+DIST_DIR = BASE_DIR / "dist"
 
 
 app = FastAPI(title="AB Test Lab API")
@@ -61,3 +64,16 @@ async def upload_csv(file: UploadFile = File(...)) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="CSV file must be UTF-8 encoded.") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+if DIST_DIR.exists():
+    assets_dir = DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_frontend(full_path: str) -> FileResponse:
+        requested_path = DIST_DIR / full_path
+        if full_path and requested_path.exists() and requested_path.is_file():
+            return FileResponse(requested_path)
+        return FileResponse(DIST_DIR / "index.html")

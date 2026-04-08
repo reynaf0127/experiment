@@ -1,41 +1,25 @@
 # Deploy On Render
 
-This project deploys best as two Render services:
-
-1. A Python Web Service for the FastAPI backend
-2. A Static Site for the Vite frontend
+This project can deploy as a single Render Web Service.
+The FastAPI backend serves the built Vite frontend from the same URL.
 
 ## Option 1: Use `render.yaml`
 
-Render can detect [render.yaml](/Users/reyna.feng/Documents/experiment/render.yaml) and create both services for you.
+Render can detect [render.yaml](/Users/reyna.feng/Documents/experiment/render.yaml) and create the web service for you.
+This setup uses [Dockerfile](/Users/reyna.feng/Documents/experiment/Dockerfile), which:
 
-After creating the services, set these environment variables:
-
-- On `ab-test-lab-api`:
-  - `CORS_ORIGINS=https://your-frontend-name.onrender.com`
-
-- On `ab-test-lab-web`:
-  - `VITE_API_BASE_URL=https://your-backend-name.onrender.com/api`
+- installs frontend dependencies
+- runs `npm run build`
+- installs Python dependencies
+- serves the React app and API from one service
 
 ## Option 2: Configure Manually
 
-### Backend web service
-
-- Runtime: Python
-- Build Command: `pip install -r requirements.txt`
-- Start Command: `uvicorn backend.app:app --host 0.0.0.0 --port $PORT`
-
-### Frontend static site
-
-- Build Command: `npm install && npm run build`
-- Publish Directory: `dist`
-
-Environment variables:
-
-- `VITE_API_BASE_URL=https://your-backend-name.onrender.com/api`
+Create a Web Service and let Render use the repo's `Dockerfile`.
+No separate Static Site is required.
 
 ## Notes
 
 - [requirements.txt](/Users/reyna.feng/Documents/experiment/requirements.txt) forwards to [backend/requirements.txt](/Users/reyna.feng/Documents/experiment/backend/requirements.txt), so Render can install Python dependencies from the repo root.
-- The frontend uses `VITE_API_BASE_URL` in production and falls back to `/api` locally.
-- Restrict `CORS_ORIGINS` to your frontend Render domain instead of `*` in production.
+- The frontend uses relative `/api` calls by default, which works well for this single-service deployment.
+- [backend/app.py](/Users/reyna.feng/Documents/experiment/backend/app.py) now serves [dist](/Users/reyna.feng/Documents/experiment/dist) so the web app is available at the same URL as the API.
