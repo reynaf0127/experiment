@@ -24,4 +24,4 @@ COPY --from=frontend-builder /app/dist ./dist
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD gunicorn backend.app:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-10000}
+CMD gunicorn backend.app:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-10000} --timeout 180 --graceful-timeout 30 --log-file -

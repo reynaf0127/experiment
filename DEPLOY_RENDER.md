@@ -23,3 +23,4 @@ No separate Static Site is required.
 - [requirements.txt](/Users/reyna.feng/Documents/experiment/requirements.txt) forwards to [backend/requirements.txt](/Users/reyna.feng/Documents/experiment/backend/requirements.txt), so Render can install Python dependencies from the repo root.
 - The frontend uses relative `/api` calls by default, which works well for this single-service deployment.
 - [backend/app.py](/Users/reyna.feng/Documents/experiment/backend/app.py) now serves [dist](/Users/reyna.feng/Documents/experiment/dist) so the web app is available at the same URL as the API.
+- [Dockerfile](/Users/reyna.feng/Documents/experiment/Dockerfile) starts Gunicorn with a longer timeout so larger CSV uploads have time to complete analysis on Render.

@@ -1009,12 +1009,20 @@ function formatSignedMetric(value: number | null, digits = 2) {
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
-  const payload = await response.json().catch(() => null);
+  const rawText = await response.text();
+  let payload: unknown = null;
+
+  try {
+    payload = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    payload = null;
+  }
+
   if (!response.ok) {
     const detail =
       payload && typeof payload === "object" && "detail" in payload && typeof payload.detail === "string"
         ? payload.detail
-        : "Request failed.";
+        : rawText.trim() || `Request failed with status ${response.status}.`;
     throw new Error(detail);
   }
   return payload as T;
